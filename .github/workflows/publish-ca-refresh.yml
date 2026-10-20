@@ -1,0 +1,115 @@
+name: Publish CA-refreshed HAProxy
+
+on:
+  push:
+    branches: [feature/emudhra-ca-refresh]
+    paths:
+      - '2.8/alpine/**'
+      - 'Dockerfile.template'
+      - '.github/workflows/publish-ca-refresh.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-ca-refresh
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/gunnarmorrigan/haproxy
+
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
+jobs:
+  build:
+    if: github.repository == 'GunnarMorrigan/haproxy'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with current Alpine packages
+        run: |
+          docker build --pull --no-cache \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE:sha-$GITHUB_SHA-${{ matrix.arch }}" ./2.8/alpine
+      - name: Verify certificate distrust and runtime user
+        run: |
+          image="$IMAGE:sha-$GITHUB_SHA-${{ matrix.arch }}"
+          test "$(docker run --rm --entrypoint id "$image" -u)" = 99
+          docker run --rm --entrypoint haproxy "$image" -v
+          docker run --rm --entrypoint cat "$image" \
+            /etc/ssl/certs/ca-certificates.crt > image-ca.pem
+          docker run --rm --entrypoint cat "$image" \
+            /usr/share/ca-certificates/mozilla/ISRG_Root_X1.crt > trusted-root.pem
+          # A positive control catches an empty or unusable trust bundle.
+          openssl verify -CAfile image-ca.pem -no-CApath -no-CAstore trusted-root.pem
+          curl --fail --location --retry 3 \
+            https://emudhra.we-have-a-problem.com/chains.zip -o chains.zip
+          echo '8a2edc81b6c51e3ad27d45ca1e441ec84c961e2dee0fc547f2a02c0f74315f95  chains.zip' | sha256sum -c -
+          unzip -q chains.zip
+          chains=(chains/*.pem)
+          test "${#chains[@]}" = 12
+          for chain in "${chains[@]}"; do
+            # Fix the verification time so expiry cannot make this test pass.
+            if output=$(openssl verify -attime 1792512000 \
+              -CAfile image-ca.pem -no-CApath -no-CAstore \
+              -untrusted "$chain" "$chain" 2>&1); then
+              echo "FAIL: compromised chain is trusted: $chain" >&2
+              exit 1
+            fi
+            case "$output" in
+              *'error 20 at '*': unable to get local issuer certificate'*)
+                echo "PASS: rejected $chain" ;;
+              *) printf '%s\n' "$output" >&2; exit 1 ;;
+            esac
+          done
+      - name: Publish tested architecture
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:sha-$GITHUB_SHA-${{ matrix.arch }}"
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publish multi-platform image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(jq -r '."2.8".version' versions.json)
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create \
+            --tag "$IMAGE:$version-alpine-ca20261020" \
+            --tag "$IMAGE:2.8-alpine-ca20261020" \
+            --tag "$IMAGE:sha-$GITHUB_SHA" \
+            "$IMAGE:sha-$GITHUB_SHA-amd64" \
+            "$IMAGE:sha-$GITHUB_SHA-arm64"
+          docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA" | tee manifest.txt
+          {
+            echo '### Patched HAProxy image'
+            echo "Image: \`$IMAGE:$version-alpine-ca20261020\`"
+            echo 'Pin the digest below when deploying:'
+            echo '```text'
+            cat manifest.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
