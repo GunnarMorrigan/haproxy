@@ -5,7 +5,9 @@ FROM alpine:{{ .alpine }}
 RUN set -eux; \
 	apk add --no-cache \
 # @system-ca: https://github.com/docker-library/haproxy/pull/216
-		ca-certificates \
+# Require Alpine's eMudhra distrust update (https://github.com/docker-library/haproxy/issues/267).
+		'ca-certificates>=20261020-r0' \
+		'ca-certificates-bundle>=20261020-r0' \
 # https://github.com/docker-library/haproxy/issues/59#issuecomment-3418639873
 		socat \
 	;
